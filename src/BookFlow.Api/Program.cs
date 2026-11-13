@@ -1,14 +1,23 @@
+using BookFlow.Api.Data;
+using BookFlow.Api.Services;
+using Microsoft.EntityFrameworkCore;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-
 builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
+builder.Services.AddDbContext<BookFlowDbContext>(options =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("BookFlow") ?? "Data Source=bookflow.db"));
+builder.Services.AddScoped<IResourceService, ResourceService>();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<BookFlowDbContext>();
+    await dbContext.Database.EnsureCreatedAsync();
+}
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
