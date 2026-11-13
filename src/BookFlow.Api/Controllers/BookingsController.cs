@@ -90,8 +90,18 @@ public sealed class BookingsController(IBookingService bookingService) : Control
                 statusCode: StatusCodes.Status409Conflict,
                 title: "Booking conflict.",
                 detail: "The resource already has a confirmed booking that overlaps this period."),
+            BookingError.Busy => BusyProblem(),
             _ => Problem(statusCode: StatusCodes.Status500InternalServerError)
         };
+    }
+
+    private ObjectResult BusyProblem()
+    {
+        Response.Headers.RetryAfter = "1";
+        return Problem(
+            statusCode: StatusCodes.Status503ServiceUnavailable,
+            title: "Service busy.",
+            detail: "The booking could not be processed right now. Please retry.");
     }
 
     private static BookingDto ToDto(Booking booking)
