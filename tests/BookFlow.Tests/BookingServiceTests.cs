@@ -366,6 +366,280 @@ public sealed class BookingServiceTests
         Assert.Null(result.Error);
     }
 
+    public static TheoryData<int> ConcurrencyIterations => new(Enumerable.Range(1, 10));
+
+    // Two independent contexts (separate connections to the same SQLite file) race to book the
+    // same slot. The Serializable/BEGIN IMMEDIATE transaction must let exactly one of them win.
+    [Theory]
+    [MemberData(nameof(ConcurrencyIterations))]
+    public async Task CreateAsync_ConcurrentRequestsForSamePeriod_OnlyOneSucceeds(int iteration)
+    {
+        _ = iteration;
+        var path = Path.Combine(Path.GetTempPath(), $"bookflow-tests-{Guid.NewGuid():N}.db");
+        var connectionString = new SqliteConnectionStringBuilder { DataSource = path }.ToString();
+        BookFlowDbContext? first = null;
+        BookFlowDbContext? second = null;
+
+        try
+        {
+            int resourceId;
+            await using (var setup = CreateFileContext(connectionString))
+            {
+                await setup.Database.EnsureCreatedAsync();
+                var resource = await new ResourceService(setup).CreateAsync("Meeting room", 8, CancellationToken.None);
+                resourceId = resource.Id;
+            }
+
+            first = CreateFileContext(connectionString);
+            second = CreateFileContext(connectionString);
+            var firstService = new BookingService(first, new FixedTimeProvider(Now));
+            var secondService = new BookingService(second, new FixedTimeProvider(Now));
+
+            using var barrier = new Barrier(2);
+            Task<BookingResult> RunAsync(BookingService service, string customerName) => Task.Run(async () =>
+            {
+                barrier.SignalAndWait();
+                return await service.CreateAsync(
+                    resourceId, customerName, ExistingStart, ExistingEnd, CancellationToken.None);
+            });
+
+            var results = await Task.WhenAll(RunAsync(firstService, "Alice"), RunAsync(secondService, "Bob"));
+
+            Assert.Single(results, result => result.Error is null && result.Booking is not null);
+            Assert.Single(results, result => result.Error == BookingError.Overlap);
+
+            await using var verify = CreateFileContext(connectionString);
+            Assert.Equal(1, await verify.Bookings.CountAsync());
+        }
+        finally
+        {
+            if (first is not null)
+            {
+                await first.DisposeAsync();
+            }
+
+            if (second is not null)
+            {
+                await second.DisposeAsync();
+            }
+
+            SqliteConnection.ClearAllPools();
+            foreach (var file in new[] { path, path + "-journal", path + "-wal", path + "-shm" })
+            {
+                if (File.Exists(file))
+                {
+                    File.Delete(file);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CreateAsync_ReturnsBusyWhenAnotherConnectionHoldsWriteLock()
+    {
+        await using var database = await TempFileDatabase.CreateAsync();
+        await using var context = database.CreateContext(timeoutSeconds: 1);
+        var service = new BookingService(context, new FixedTimeProvider(Now));
+
+        await using (await database.HoldWriteLockAsync())
+        {
+            var result = await service.CreateAsync(
+                database.ResourceId, "Alice", ExistingStart, ExistingEnd, CancellationToken.None);
+
+            Assert.Equal(BookingError.Busy, result.Error);
+            Assert.Null(result.Booking);
+        }
+
+        await using var verify = database.CreateContext(timeoutSeconds: 1);
+        Assert.Equal(0, await verify.Bookings.CountAsync());
+    }
+
+    [Fact]
+    public async Task UpdateAsync_ReturnsBusyWhenAnotherConnectionHoldsWriteLock()
+    {
+        await using var database = await TempFileDatabase.CreateAsync();
+        int bookingId;
+        await using (var seed = database.CreateContext(timeoutSeconds: 1))
+        {
+            var created = await new BookingService(seed, new FixedTimeProvider(Now)).CreateAsync(
+                database.ResourceId, "Alice", ExistingStart, ExistingEnd, CancellationToken.None);
+            Assert.NotNull(created.Booking);
+            bookingId = created.Booking.Id;
+        }
+
+        await using var context = database.CreateContext(timeoutSeconds: 1);
+        var service = new BookingService(context, new FixedTimeProvider(Now));
+
+        await using (await database.HoldWriteLockAsync())
+        {
+            var result = await service.UpdateAsync(
+                bookingId, database.ResourceId, "Bob", Now.AddHours(20), Now.AddHours(21), CancellationToken.None);
+
+            Assert.Equal(BookingError.Busy, result.Error);
+            Assert.Null(result.Booking);
+        }
+
+        await using var verify = database.CreateContext(timeoutSeconds: 1);
+        var stored = await verify.Bookings.SingleAsync();
+        Assert.Equal(bookingId, stored.Id);
+        Assert.Equal("Alice", stored.CustomerName);
+        Assert.Equal(ExistingStart, stored.Start);
+        Assert.Equal(ExistingEnd, stored.End);
+    }
+
+    public static TheoryData<int, int> InvalidPeriodsInMinutes => new()
+    {
+        { 0, 0 },     // End == Start
+        { 60, 0 }     // End < Start
+    };
+
+    // The busy timeout is deliberately long (5 s). If the period were validated after taking the
+    // write lock, these calls would block for the full timeout and then return Busy.
+    [Theory]
+    [MemberData(nameof(InvalidPeriodsInMinutes))]
+    public async Task CreateAsync_RejectsInvalidPeriodWithoutWaitingForWriteLock(int startOffset, int endOffset)
+    {
+        await using var database = await TempFileDatabase.CreateAsync();
+        await using var context = database.CreateContext(timeoutSeconds: 5);
+        var service = new BookingService(context, new FixedTimeProvider(Now));
+
+        await using (await database.HoldWriteLockAsync())
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var result = await service.CreateAsync(
+                database.ResourceId,
+                "Alice",
+                ExistingStart.AddMinutes(startOffset),
+                ExistingStart.AddMinutes(endOffset),
+                CancellationToken.None);
+            stopwatch.Stop();
+
+            Assert.Equal(BookingError.EndNotAfterStart, result.Error);
+            Assert.True(
+                stopwatch.Elapsed < TimeSpan.FromSeconds(1),
+                $"Expected immediate rejection, took {stopwatch.Elapsed}.");
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidPeriodsInMinutes))]
+    public async Task UpdateAsync_RejectsInvalidPeriodWithoutWaitingForWriteLock(int startOffset, int endOffset)
+    {
+        await using var database = await TempFileDatabase.CreateAsync();
+        await using var context = database.CreateContext(timeoutSeconds: 5);
+        var service = new BookingService(context, new FixedTimeProvider(Now));
+
+        await using (await database.HoldWriteLockAsync())
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var result = await service.UpdateAsync(
+                1,
+                database.ResourceId,
+                "Alice",
+                ExistingStart.AddMinutes(startOffset),
+                ExistingStart.AddMinutes(endOffset),
+                CancellationToken.None);
+            stopwatch.Stop();
+
+            Assert.Equal(BookingError.EndNotAfterStart, result.Error);
+            Assert.True(
+                stopwatch.Elapsed < TimeSpan.FromSeconds(1),
+                $"Expected immediate rejection, took {stopwatch.Elapsed}.");
+        }
+    }
+
+    // Temporary SQLite file database with one seeded resource, for tests that need several
+    // connections (locking/concurrency). Deletes the file and its journal on dispose.
+    private sealed class TempFileDatabase : IAsyncDisposable
+    {
+        private readonly string _path;
+
+        private TempFileDatabase(string path)
+        {
+            _path = path;
+        }
+
+        public int ResourceId { get; private set; }
+
+        public static async Task<TempFileDatabase> CreateAsync()
+        {
+            var database = new TempFileDatabase(
+                Path.Combine(Path.GetTempPath(), $"bookflow-tests-{Guid.NewGuid():N}.db"));
+            await using var setup = database.CreateContext(timeoutSeconds: 5);
+            await setup.Database.EnsureCreatedAsync();
+            var resource = await new ResourceService(setup).CreateAsync("Meeting room", 8, CancellationToken.None);
+            database.ResourceId = resource.Id;
+            return database;
+        }
+
+        public BookFlowDbContext CreateContext(int timeoutSeconds)
+        {
+            var options = new DbContextOptionsBuilder<BookFlowDbContext>()
+                .UseSqlite(ConnectionString(timeoutSeconds), sqlite => sqlite.CommandTimeout(timeoutSeconds))
+                .Options;
+            return new BookFlowDbContext(options);
+        }
+
+        // Opens a separate connection and takes the database write lock until disposed (ROLLBACK).
+        public async Task<IAsyncDisposable> HoldWriteLockAsync()
+        {
+            var connection = new SqliteConnection(ConnectionString(timeoutSeconds: 5));
+            await connection.OpenAsync();
+            await using (var begin = connection.CreateCommand())
+            {
+                begin.CommandText = "BEGIN IMMEDIATE;";
+                await begin.ExecuteNonQueryAsync();
+            }
+
+            return new WriteLock(connection);
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var file in new[] { _path, _path + "-journal", _path + "-wal", _path + "-shm" })
+            {
+                if (File.Exists(file))
+                {
+                    File.Delete(file);
+                }
+            }
+
+            return ValueTask.CompletedTask;
+        }
+
+        private string ConnectionString(int timeoutSeconds)
+        {
+            return new SqliteConnectionStringBuilder
+            {
+                DataSource = _path,
+                DefaultTimeout = timeoutSeconds
+            }.ToString();
+        }
+
+        private sealed class WriteLock(SqliteConnection connection) : IAsyncDisposable
+        {
+            public async ValueTask DisposeAsync()
+            {
+                await using (var rollback = connection.CreateCommand())
+                {
+                    rollback.CommandText = "ROLLBACK;";
+                    await rollback.ExecuteNonQueryAsync();
+                }
+
+                await connection.DisposeAsync();
+            }
+        }
+    }
+
+    private static BookFlowDbContext CreateFileContext(string connectionString)
+    {
+        var options = new DbContextOptionsBuilder<BookFlowDbContext>()
+            .UseSqlite(connectionString)
+            .Options;
+        return new BookFlowDbContext(options);
+    }
+
     private static async Task<Booking> SeedBookingAsync(
         TestDatabase database,
         DateTimeOffset start,

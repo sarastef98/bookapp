@@ -8,7 +8,8 @@ public enum BookingError
     ResourceNotFound,
     EndNotAfterStart,
     StartInPast,
-    Overlap
+    Overlap,
+    Busy
 }
 
 public sealed record BookingResult(Booking? Booking, BookingError? Error)
