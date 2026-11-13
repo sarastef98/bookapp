@@ -14,12 +14,44 @@ partial class BookFlowDbContextModelSnapshot : ModelSnapshot
     // If you encounter a merge conflict in the line below, it means you need to
     // discard one of the migration branches and recreate its migrations on top of
     // the other branch. See https://aka.ms/efcore-docs-migrations-conflicts for more info.
-    public override string LastMigrationId => "20261113131702_InitialCreate";
+    public override string LastMigrationId => "20261113141425_AddBookings";
 
     protected override void BuildModel(ModelBuilder modelBuilder)
     {
 #pragma warning disable 612, 618
         modelBuilder.HasAnnotation("ProductVersion", "11.0.0");
+
+        modelBuilder.Entity("BookFlow.Api.Domain.Booking", b =>
+            {
+                b.Property<int>("Id")
+                    .ValueGeneratedOnAdd()
+                    .HasColumnType("INTEGER");
+
+                b.Property<string>("CustomerName")
+                    .IsRequired()
+                    .HasMaxLength(200)
+                    .HasColumnType("TEXT");
+
+                b.Property<long>("End")
+                    .HasColumnType("INTEGER");
+
+                b.Property<int>("ResourceId")
+                    .HasColumnType("INTEGER");
+
+                b.Property<long>("Start")
+                    .HasColumnType("INTEGER");
+
+                b.Property<string>("Status")
+                    .IsRequired()
+                    .HasMaxLength(20)
+                    .HasColumnType("TEXT");
+
+                b.HasKey("Id");
+
+                b.HasIndex("ResourceId", "Status");
+
+                b.ToTable("Bookings");
+            });
 
         modelBuilder.Entity("BookFlow.Api.Domain.Resource", b =>
             {
@@ -37,6 +69,15 @@ partial class BookFlowDbContextModelSnapshot : ModelSnapshot
                 b.HasKey("Id");
 
                 b.ToTable("Resources");
+            });
+
+        modelBuilder.Entity("BookFlow.Api.Domain.Booking", b =>
+            {
+                b.HasOne("BookFlow.Api.Domain.Resource", null)
+                    .WithMany()
+                    .HasForeignKey("ResourceId")
+                    .OnDelete(DeleteBehavior.Cascade)
+                    .IsRequired();
             });
 #pragma warning restore 612, 618
     }

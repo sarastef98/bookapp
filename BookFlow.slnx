@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="CLAUDE.md" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/BookFlow.Api/BookFlow.Api.csproj" />
   </Folder>

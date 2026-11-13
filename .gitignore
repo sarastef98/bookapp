@@ -485,3 +485,11 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# BookFlow: local SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# BookFlow: production config is managed outside this repo (see CLAUDE.md)
+src/BookFlow.Api/appsettings.Production.json

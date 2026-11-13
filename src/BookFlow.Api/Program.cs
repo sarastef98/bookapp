@@ -4,11 +4,14 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers();
+// Keep the "Async" suffix in action names so CreatedAtAction(nameof(GetByIdAsync), ...) resolves.
+builder.Services.AddControllers(options => options.SuppressAsyncSuffixInActionNames = false);
 builder.Services.AddOpenApi();
 builder.Services.AddDbContext<BookFlowDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("BookFlow") ?? "Data Source=bookflow.db"));
 builder.Services.AddScoped<IResourceService, ResourceService>();
+builder.Services.AddScoped<IBookingService, BookingService>();
+builder.Services.AddSingleton(TimeProvider.System);
 
 var app = builder.Build();
 
